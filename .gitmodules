@@ -1,0 +1,3 @@
+[submodule "fid"]
+	path = fid
+	url = https://github.com/mseitzer/pytorch-fid.git

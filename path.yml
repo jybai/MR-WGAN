@@ -1,0 +1,3 @@
+img_dir: /home/cybai2020/mrgan/images
+data_dir: /home/cybai2020/mrgan/data/cifar10
+prep_dataset_path: /home/cybai2020/mrgan/cifar10-train.npz
