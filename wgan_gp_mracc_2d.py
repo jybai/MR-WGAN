@@ -23,7 +23,8 @@ from tensorboardX import SummaryWriter
 from torchsummary import summary
 
 from fid.inception import InceptionV3
-from build_dataset_fid_stats import get_activation
+from fid.fid_score import calculate_frechet_distance
+from build_dataset_fid_stats import get_activation, get_stats
 
 path_file = 'path.yml'
 with open(path_file) as f:
@@ -45,6 +46,7 @@ parser.add_argument("--gp", type=float, default=10., help="Loss weight for gradi
 parser.add_argument("--mrt", type=float, default=0, help="Minimum memorization rejection threshold, cosine distance have to be greater than mrt")
 parser.add_argument("--mrt_decay", type=float, default=0.01, help="Decay for minimum memorization rejection threshold in case nothing satisfies")
 parser.add_argument("--sample_interval", type=int, default=100, help="interval betwen image samples")
+parser.add_argument("--metric_interval", type=int, default=100, help="interval betwen metrics evaluations")
 opt = parser.parse_args()
 print(opt)
 
@@ -172,6 +174,8 @@ def compute_gradient_penalty(D, real_samples, fake_samples):
 prep_dataset_path = paths['prep_dataset_path']
 f = np.load(prep_dataset_path)
 real_features = torch.from_numpy(f['features'][:]).type(torch.FloatTensor).cuda() # [50000, 2048]
+real_mu = torch.from_numpy(f['mu'][:]).type(torch.FloatTensor) # [2048]
+real_sigma = torch.from_numpy(f['sigma'][:]).type(torch.FloatTensor) # [2048]
 f.close()
 real_features = torch.div(real_features, torch.norm(real_features, dim=1).view(-1, 1))
 
@@ -180,11 +184,15 @@ inception_v3 = InceptionV3([block_idx])
 if cuda:
     inception_v3.cuda()
 
-def compute_memorization_rejection_mask(fake_imgs, t):
-    fake_features = get_activation(fake_imgs, inception_v3, cuda=cuda).view(-1, 2048)
+def compute_memorization_distance(fake_features):
     fake_features = torch.div(fake_features, torch.norm(fake_features, dim=1).view(-1, 1))
     d = 1.0 - torch.abs(torch.mm(fake_features, real_features.T))
     min_d, _ = torch.min(d, dim=1)
+    return min_d
+
+def compute_memorization_rejection_mask(fake_imgs, t):
+    fake_features = get_activation(fake_imgs, inception_v3, cuda=cuda).view(-1, 2048)
+    min_d = compute_memorization_distance(fake_features)
     return min_d > t
 
 # prepare save directory
@@ -314,10 +322,20 @@ for epoch in range(opt.n_epochs):
 
     if epoch % opt.sample_interval == 0:
         img_fname = os.path.join(log_dir, f"{epoch}.png")
-        save_image(fake_imgs.data[:25], img_fname, nrow=5, normalize=True)
+        save_image(fake_imgs.data[:36], img_fname, nrow=6, normalize=True)
 
-        sampled_images = make_grid(fake_imgs.data[:25], nrow=5, normalize=True)
+        sampled_images = make_grid(fake_imgs.data[:36], nrow=6, normalize=True)
         writer.add_image('sampled_images', sampled_images, epoch)
+
+    if epoch % opt.metric_interval == 0:
+        fake_features = get_activation(fake_imgs, inception_v3, cuda=cuda).view(-1, 2048)
+        mmd = compute_memorization_distance(fake_features).mean()
+        # compute in numpy
+        fake_mu, fake_sigma = get_stats(fake_features.cpu().data.numpy())
+        fid = calculate_frechet_distance(fake_mu, fake_sigma, real_mu, real_sigma)
+        writer.add_scalar('metric/fid', fid, epoch)
+        writer.add_scalar('metric/mmd', mmd.item(), epoch)
+        print("[Epoch %d/%d] [fid: %f] [mmd: %f]" % (epoch, opt.n_epochs, fid, mmd.item()))
 
 export_json = os.path.join(log_dir, "all_scalars.json")
 writer.export_scalars_to_json(export_json)
