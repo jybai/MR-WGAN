@@ -49,6 +49,7 @@ parser.add_argument("--mrt", type=float, default=0, help="Minimum memorization r
 parser.add_argument("--mrt_decay", type=float, default=0.01, help="Decay for minimum memorization rejection threshold in case nothing satisfies")
 parser.add_argument("--sample_interval", type=int, default=100, help="interval betwen image samples")
 parser.add_argument("--metric_interval", type=int, default=100, help="interval betwen metrics evaluations")
+parser.add_argument("--save_model_interval", type=int, default=1000, help="interval betwen model saves")
 opt = parser.parse_args()
 print(opt)
 
@@ -316,6 +317,14 @@ for epoch in range(opt.n_epochs):
         writer.add_scalar('metric/fid', fid, epoch)
         writer.add_scalar('metric/mmd', mmd.item(), epoch)
         print("[Epoch %d/%d] [fid: %f] [mmd: %f]" % (epoch, opt.n_epochs, fid, mmd.item()))
+
+    if epoch % opt.save_model_interval == 0 and epoch > 0:
+        torch.save(generator.state_dict(), os.path.join(log_dir, f"generator_epoch{epoch}.pth"))
+        torch.save(discriminator.state_dict(), os.path.join(log_dir, f"discriminator_epoch{epoch}.pth"))
+
+# final save
+torch.save(generator.state_dict(), os.path.join(log_dir, "generator.pth"))
+torch.save(discriminator.state_dict(), os.path.join(log_dir, "discriminator.pth"))
 
 export_json = os.path.join(log_dir, "all_scalars.json")
 writer.export_scalars_to_json(export_json)
