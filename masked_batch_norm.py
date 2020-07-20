@@ -74,7 +74,7 @@ class MaskedBatchNorm(nn.Module):
         if self.track_running_stats and self.training and self.manual_update:
             if self.input_cache is not None:
                 raise ValueError('Should clear update running stats with cache before next forward pass when manual_update = True')
-            self.input_cache = input
+            self.input_cache = input.clone()
         # Calculate the mean and variance
         B = input.shape[0]
         C = input.shape[1]
@@ -95,8 +95,9 @@ class MaskedBatchNorm(nn.Module):
             # Commit running stats if manual_update = False
             if not self.manual_update:
                 assert(running_mean is not None and running_var is not None)
-                self.running_mean = running_mean
-                self.running_var = running_var
+                with torch.no_grad(): # avoid memory leak!
+                    self.running_mean = running_mean
+                    self.running_var = running_var
         # Norm the input
         if self.track_running_stats and not self.training:
             normed = (input - running_mean.view(view_shape)) / (torch.sqrt(running_var.view(view_shape) + self.eps))
@@ -132,140 +133,12 @@ class MaskedBatchNorm(nn.Module):
         current_mean = masked_sum / n
         current_var = ((masked - current_mean.view(view_shape)) ** 2).sum(reduce_dims) / n
         # Update running stats
-        self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * current_mean
-        self.running_var = (1 - self.momentum) * self.running_var + self.momentum * current_var * n / (n - 1)
-        # Clear cache
+        with torch.no_grad(): # avoid memory leak!
+            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * current_mean
+            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * current_var * n / (n - 1)
+        # Free and clear cache
+        del self.input_cache
         self.input_cache = None
-
-class MaskedBatchNorm1d(nn.Module):
-    """ A masked version of nn.BatchNorm1d. Only tested for 3D inputs.
-
-        Args:
-            num_features: :math:`C` from an expected input of size
-                :math:`(N, C, L)`
-            eps: a value added to the denominator for numerical stability.
-                Default: 1e-5
-            momentum: the value used for the running_mean and running_var
-                computation. Can be set to ``None`` for cumulative moving average
-                (i.e. simple average). Default: 0.1
-            affine: a boolean value that when set to ``True``, this module has
-                learnable affine parameters. Default: ``True``
-            track_running_stats: a boolean value that when set to ``True``, this
-                module tracks the running mean and variance, and when set to ``False``,
-                this module does not track such statistics and always uses batch
-                statistics in both training and eval modes. Default: ``True``
-
-        Shape:
-            - Input: :math:`(N, C, L)`
-            - input_mask: (N, 1, L) tensor of ones and zeros, where the zeros indicate locations not to use.
-            - Output: :math:`(N, C)` or :math:`(N, C, L)` (same shape as input)
-    """
-
-    def __init__(self, num_features, eps=1e-5, momentum=0.1,
-                 affine=True, track_running_stats=True, manual_update=True):
-        super(MaskedBatchNorm1d, self).__init__()
-        self.num_features = num_features
-        self.eps = eps
-        self.momentum = momentum
-        self.affine = affine
-        if affine:
-            self.weight = nn.Parameter(torch.Tensor(num_features, 1))
-            self.bias = nn.Parameter(torch.Tensor(num_features, 1))
-        else:
-            self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
-        self.track_running_stats = track_running_stats
-        if self.track_running_stats:
-            self.register_buffer('running_mean', torch.zeros(num_features, 1))
-            self.register_buffer('running_var', torch.ones(num_features, 1))
-        else:
-            self.register_parameter('running_mean', None)
-            self.register_parameter('running_var', None)
-        self.manual_update = manual_update
-        self.input_cache = None
-        self.reset_parameters()
-
-    def reset_running_stats(self):
-        if self.track_running_stats:
-            self.running_mean.zero_()
-            self.running_var.fill_(1)
-
-    def reset_parameters(self):
-        self.reset_running_stats()
-        if self.affine:
-            init.ones_(self.weight)
-            init.zeros_(self.bias)
-
-    def forward(self, input):
-        # expand input size
-        squeeze = False
-        if len(input.size()) == 2:
-            input = torch.unsqueeze(input, -1)
-            squeeze = True
-        # Update cache
-        if self.track_running_stats and self.training and self.manual_update:
-            if self.input_cache is not None:
-                raise ValueError('Should clear update running stats with cache before next forward pass when manual_update = True')
-            self.input_cache = input
-        # Calculate the mean and variance
-        B, C, L = input.shape
-        if C != self.num_features:
-            raise ValueError('Expected %d channels but input has %d channels' % (self.num_features, C))
-        n = B * L
-        current_mean = input.mean([0, 2], keepdim=True)
-        # current_mean = input.sum(dim=0, keepdim=True).sum(dim=2, keepdim=True) / n
-        current_var = input.var([0, 2], unbiased=False, keepdim=True)
-        # current_var = ((input - current_mean) ** 2).sum(dim=0, keepdim=True).sum(dim=2, keepdim=True) / (n - 1)
-        running_mean = current_mean if self.training else self.running_mean
-        # running_mean = self.running_mean
-        running_var = current_var if self.training else self.running_var
-        # running_var = self.running_var
-        # Calculate running stats
-        if self.track_running_stats and self.training:
-            running_mean = (1 - self.momentum) * self.running_mean + self.momentum * current_mean
-            running_var = (1 - self.momentum) * self.running_var + self.momentum * current_var * n / (n - 1)
-            # Commit running stats if manual_update = False
-            if not self.manual_update:
-                assert(running_mean is not None and running_var is not None)
-                self.running_mean = running_mean
-                self.running_var = running_var
-        # Norm the input
-        if self.track_running_stats and not self.training:
-            normed = (input - running_mean) / (torch.sqrt(running_var + self.eps))
-        else:
-            normed = (input - current_mean) / (torch.sqrt(current_var + self.eps))
-        # Apply affine parameters
-        if self.affine:
-            normed = normed * self.weight + self.bias
-        # print('fwd', running_mean, running_var)
-        if squeeze:
-            normed = torch.squeeze(normed, -1)
-        return normed
-
-    def update_masked_running_stats(self, input_mask):
-        if not (self.manual_update and self.track_running_stats and self.training):
-            raise ValueError('Should only call update_running_stats when self.manual_update = True, self.track_running_stats = True, and self.training = True.')
-        if self.input_cache is None:
-            raise ValueError('Should perform forward pass and cache input before calling update_running_stats when manual_update = True')
-        B, C, L = self.input_cache.shape
-        if input_mask.shape != (B, 1, L):
-            raise ValueError('Mask should have shape (B, 1, L).')
-        if C != self.num_features:
-            raise ValueError('Expected %d channels but input has %d channels' % (self.num_features, C))
-        # Apply input_mask
-        masked = self.input_cache * input_mask
-        n = input_mask.sum()
-        # Sum
-        masked_sum = masked.sum(dim=0, keepdim=True).sum(dim=2, keepdim=True)
-        # Divide by sum of mask
-        current_mean = masked_sum / n
-        current_var = ((masked - current_mean) ** 2).sum(dim=0, keepdim=True).sum(dim=2, keepdim=True) / n
-        # Update running stats
-        self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * current_mean
-        self.running_var = (1 - self.momentum) * self.running_var + self.momentum * current_var * n / (n - 1)
-        # Clear cache
-        self.input_cache = None
-
 
 def compare_bn(bn1, bn2):
     err = False

@@ -116,6 +116,7 @@ dataloader = torch.utils.data.DataLoader(
     ),
     batch_size=opt.batch_size,
     shuffle=True,
+    drop_last=True,
 )
 
 # Optimizers
@@ -238,7 +239,7 @@ for epoch in range(opt.n_epochs):
     writer.add_scalar('loss/d_loss', d_loss.item(), epoch)
     writer.add_scalar('loss/g_loss', g_loss.item(), epoch)
 
-    if epoch % opt.sample_interval == opt.sample_interval - 1:
+    if epoch % opt.sample_interval == 0:
         img_fname = os.path.join(log_dir, f"{epoch}.png")
         save_image(fake_imgs.data[:25], img_fname, nrow=5, normalize=True)
 

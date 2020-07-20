@@ -42,7 +42,7 @@ parser.add_argument("--n_critic", type=int, default=5, help="number of training 
 parser.add_argument("--gp", type=float, default=10., help="Loss weight for gradient penalty")
 parser.add_argument("--mrt", type=float, default=0, help="Minimum memorization rejection threshold, cosine distance have to be greater than mrt")
 parser.add_argument("--mrt_decay", type=float, default=0.01, help="Decay for minimum memorization rejection threshold in case nothing satisfies")
-parser.add_argument("--sample_interval", type=int, default=5000, help="interval betwen image samples")
+parser.add_argument("--sample_interval", type=int, default=100, help="interval betwen image samples")
 opt = parser.parse_args()
 print(opt)
 
@@ -118,6 +118,7 @@ dataloader = torch.utils.data.DataLoader(
     ),
     batch_size=opt.batch_size,
     shuffle=True,
+    drop_last=True,
 )
 
 # Optimizers

@@ -24,7 +24,7 @@ from tensorboardX import SummaryWriter
 from fid.inception import InceptionV3
 from build_dataset_fid_stats import get_activation
 
-from masked_batch_norm import MaskedBatchNorm1d
+from masked_batch_norm import MaskedBatchNorm
 
 path_file = 'path.yml'
 with open(path_file) as f:
@@ -44,7 +44,7 @@ parser.add_argument("--n_critic", type=int, default=5, help="number of training 
 parser.add_argument("--gp", type=float, default=10., help="Loss weight for gradient penalty")
 parser.add_argument("--mrt", type=float, default=0, help="Minimum memorization rejection threshold, cosine distance have to be greater than mrt")
 parser.add_argument("--mrt_decay", type=float, default=0.01, help="Decay for minimum memorization rejection threshold in case nothing satisfies")
-parser.add_argument("--sample_interval", type=int, default=5000, help="interval betwen image samples")
+parser.add_argument("--sample_interval", type=int, default=100, help="interval betwen image samples")
 opt = parser.parse_args()
 print(opt)
 
@@ -63,7 +63,7 @@ class Generator(nn.Module):
             layers = [nn.Linear(in_feat, out_feat)]
             if normalize:
                 # layers.append(nn.BatchNorm1d(out_feat, momentum=0.8))
-                layers.append(MaskedBatchNorm1d(out_feat, momentum=0.8))
+                layers.append(MaskedBatchNorm(out_feat, momentum=0.8))
             layers.append(nn.LeakyReLU(negative_slope=0.2, inplace=True))
             return layers
 
@@ -83,8 +83,8 @@ class Generator(nn.Module):
 
     def update_masked_bn(self, mask):
         for m in self.model.modules():
-            if isinstance(m, MaskedBatchNorm1d):
-                m.update_masked_running_stats(mask.view(-1, 1, 1))
+            if isinstance(m, MaskedBatchNorm):
+                m.update_masked_running_stats(mask)
 
 class Discriminator(nn.Module):
     def __init__(self):
@@ -125,6 +125,7 @@ dataloader = torch.utils.data.DataLoader(
     ),
     batch_size=opt.batch_size,
     shuffle=True,
+    drop_last=True,
 )
 
 # Optimizers

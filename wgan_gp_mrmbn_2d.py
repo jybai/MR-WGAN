@@ -32,6 +32,7 @@ with open(path_file) as f:
     paths = yaml.load(f, Loader=yaml.FullLoader)
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--verbose', action='store_true')
 parser.add_argument("--n_epochs", type=int, default=200000, help="number of epochs of training")
 parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
 parser.add_argument("--lr", type=float, default=0.00005, help="adam: learning rate")
@@ -45,7 +46,7 @@ parser.add_argument("--n_critic", type=int, default=5, help="number of training 
 parser.add_argument("--gp", type=float, default=10., help="Loss weight for gradient penalty")
 parser.add_argument("--mrt", type=float, default=0, help="Minimum memorization rejection threshold, cosine distance have to be greater than mrt")
 parser.add_argument("--mrt_decay", type=float, default=0.01, help="Decay for minimum memorization rejection threshold in case nothing satisfies")
-parser.add_argument("--sample_interval", type=int, default=5000, help="interval betwen image samples")
+parser.add_argument("--sample_interval", type=int, default=100, help="interval betwen image samples")
 opt = parser.parse_args()
 print(opt)
 
@@ -73,6 +74,7 @@ class Generator(nn.Module):
             layers = [nn.ConvTranspose2d(in_feat, out_feat, kernel_size=5, stride=2, padding=2, output_padding=1)]
             if normalize:
                 layers.append(MaskedBatchNorm(out_feat, momentum=0.8))
+                # layers.append(nn.BatchNorm2d(out_feat, momentum=0.8))
             layers.append(nn.ReLU(inplace=True))
             return layers
 
@@ -146,6 +148,7 @@ dataloader = torch.utils.data.DataLoader(
     ),
     batch_size=opt.batch_size,
     shuffle=True,
+    drop_last=True,
 )
 
 # Optimizers
@@ -215,13 +218,12 @@ start_mr = torch.cuda.Event(enable_timing=True)
 end_mr = torch.cuda.Event(enable_timing=True)
 for epoch in range(opt.n_epochs):
     for i, (imgs, _) in enumerate(dataloader):
-        '''
-        if i > 0:
-            end.record()
-            torch.cuda.synchronize()
-            print(f"Batch {i}", start.elapsed_time(end), start_mr.elapsed_time(end_mr))
-        start.record()
-        '''
+        if opt.verbose:
+            if i > 0:
+                end.record()
+                torch.cuda.synchronize()
+                print(f"Batch {i}", start.elapsed_time(end), start_mr.elapsed_time(end_mr))
+            start.record()
         # Configure input
         real_imgs = Variable(imgs.type(Tensor))
 
@@ -235,12 +237,14 @@ for epoch in range(opt.n_epochs):
         z = Variable(Tensor(np.random.normal(0, 1, (imgs.shape[0], opt.latent_dim))))
 
         # Generate a batch of images
-        # start_mr.record()
+        if opt.verbose:
+            start_mr.record()
         fake_imgs = generator(z)
         with torch.no_grad():
             mr_mask = compute_memorization_rejection_mask(fake_imgs, t=opt.mrt)
         generator.update_masked_bn(mr_mask)
-        # end_mr.record()
+        if opt.verbose:
+            end_mr.record()
 
         # Real images
         real_validity = discriminator(real_imgs)
