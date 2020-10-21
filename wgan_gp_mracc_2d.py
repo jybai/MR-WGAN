@@ -44,7 +44,7 @@ parser.add_argument("--channels", type=int, default=3, help="number of image cha
 parser.add_argument("--n_critic", type=int, default=5, help="number of training steps for discriminator per iter")
 parser.add_argument("--gp", type=float, default=10., help="Loss weight for gradient penalty")
 parser.add_argument("--mrt", type=float, default=0, help="Minimum memorization rejection threshold, cosine distance have to be greater than mrt")
-parser.add_argument("--mrt_decay", type=float, default=0.01, help="Decay for minimum memorization rejection threshold in case nothing satisfies")
+parser.add_argument("--mrt_decay", type=float, default=0.02, help="Decay for minimum memorization rejection threshold in case nothing satisfies")
 parser.add_argument("--sample_interval", type=int, default=100, help="interval betwen image samples")
 parser.add_argument("--metric_interval", type=int, default=100, help="interval betwen metrics evaluations")
 parser.add_argument("--save_model_interval", type=int, default=1000, help="interval betwen model saves")
@@ -182,6 +182,7 @@ real_features = torch.div(real_features, torch.norm(real_features, dim=1).view(-
 
 block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
 inception_v3 = InceptionV3([block_idx])
+inception_v3.eval()
 if cuda:
     inception_v3.cuda()
 
@@ -310,10 +311,11 @@ for epoch in range(opt.n_epochs):
             g_loss.backward()
             optimizer_G.step()
 
-            print(
-                    "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f] [mrr: %f] [mrt: %f]"
-                % (epoch, opt.n_epochs, i, len(dataloader), d_loss.item(), g_loss.item(), mrr.item(), mrt)
-            )
+            if opt.verbose:
+                print(
+                        "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f] [mrr: %f] [mrt: %f]"
+                    % (epoch, opt.n_epochs, i, len(dataloader), d_loss.item(), g_loss.item(), mrr.item(), mrt)
+                )
             batches_done += opt.n_critic
 
     writer.add_scalar('loss/d_loss', d_loss.item(), epoch)
@@ -329,14 +331,14 @@ for epoch in range(opt.n_epochs):
         writer.add_image('sampled_images', sampled_images, epoch)
 
     if epoch % opt.metric_interval == 0:
-        fake_features = get_activation(fake_imgs, inception_v3, cuda=cuda).view(-1, 2048)
+        fake_features = get_activation((fake_imgs + 1) / 2, inception_v3, cuda=cuda).view(-1, 2048) # scale [-1, 1] to [0, 1]
         mmd = compute_memorization_distance(fake_features).mean()
         # compute in numpy
         fake_mu, fake_sigma = get_stats(fake_features.cpu().data.numpy())
         fid = calculate_frechet_distance(fake_mu, fake_sigma, real_mu, real_sigma)
         writer.add_scalar('metric/fid', fid, epoch)
         writer.add_scalar('metric/mmd', mmd.item(), epoch)
-        print("[Epoch %d/%d] [fid: %f] [mmd: %f]" % (epoch, opt.n_epochs, fid, mmd.item()))
+        print("[Epoch %d/%d] [D loss: %f] [G loss: %f] [mrr: %f] [mrt: %f] [fid: %f] [mmd: %f]" % (epoch, opt.n_epochs, d_loss.item(), g_loss.item(), mrr.item(), mrt, fid, mmd.item()))
 
     if epoch % opt.save_model_interval == 0 and epoch > 0:
         torch.save(generator.state_dict(), os.path.join(log_dir, f"generator_epoch{epoch}.pth"))

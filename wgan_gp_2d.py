@@ -24,13 +24,14 @@ from torchsummary import summary
 
 from fid.inception import InceptionV3
 from fid.fid_score import calculate_frechet_distance
-from build_dataset_fid_stats import get_activation, get_stats
+from build_dataset_fid_stats import get_activations, get_stats
 
 path_file = 'path.yml'
 with open(path_file) as f:
     paths = yaml.load(f, Loader=yaml.FullLoader)
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--verbose', action='store_true')
 parser.add_argument("--n_epochs", type=int, default=200000, help="number of epochs of training")
 parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
 parser.add_argument("--lr", type=float, default=0.00005, help="adam: learning rate")
@@ -42,6 +43,7 @@ parser.add_argument("--img_size", type=int, default=32, help="size of each image
 parser.add_argument("--channels", type=int, default=3, help="number of image channels")
 parser.add_argument("--n_critic", type=int, default=5, help="number of training steps for discriminator per iter")
 parser.add_argument("--gp", type=float, default=10., help="Loss weight for gradient penalty")
+parser.add_argument("--num_samples", type=int, default=10000, help="number of samples")
 parser.add_argument("--sample_interval", type=int, default=100, help="interval betwen image samples")
 parser.add_argument("--metric_interval", type=int, default=100, help="interval betwen metrics evaluations")
 parser.add_argument("--save_model_interval", type=int, default=1000, help="interval betwen model saves")
@@ -169,24 +171,38 @@ def compute_gradient_penalty(D, real_samples, fake_samples):
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
     return gradient_penalty
 
+def normalize_rows(x):
+    x = x[np.sum(x, axis=1) != 0]
+    x = np.nan_to_num(x/np.linalg.norm(x, ord=2, axis=1, keepdims=True))
+    return x
+
 # load prep train features
 prep_dataset_path = paths['prep_dataset_path']
 f = np.load(prep_dataset_path)
-real_features = torch.from_numpy(f['features'][:]).type(torch.FloatTensor).cuda() # [50000, 2048]
-real_mu = torch.from_numpy(f['mu'][:]).type(torch.FloatTensor) # [2048]
-real_sigma = torch.from_numpy(f['sigma'][:]).type(torch.FloatTensor) # [2048]
+real_features = normalize_rows(f['features'][:])
+real_features_tensor = torch.from_numpy(real_features).type(torch.FloatTensor).cuda() # [50000, 2048]
+real_mu = f['mu'][:]
+# real_mu = torch.from_numpy(real_mu_np).type(torch.FloatTensor) # [2048]
+real_sigma = f['sigma'][:]
+# real_sigma = torch.from_numpy(f['sigma'][:]).type(torch.FloatTensor) # [2048]
 f.close()
-real_features = torch.div(real_features, torch.norm(real_features, dim=1).view(-1, 1))
+# real_features = torch.div(real_features, torch.norm(real_features, dim=1).view(-1, 1))
 
 block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
 inception_v3 = InceptionV3([block_idx])
+inception_v3.eval()
 if cuda:
     inception_v3.cuda()
 
-def compute_memorization_distance(fake_features):
-    fake_features = torch.div(fake_features, torch.norm(fake_features, dim=1).view(-1, 1))
-    d = 1.0 - torch.abs(torch.mm(fake_features, real_features.T))
-    min_d, _ = torch.min(d, dim=1)
+def compute_memorization_distance(fake_features, use_numpy=False):
+    if use_numpy:
+        fake_features = normalize_rows(fake_features)
+        d = 1.0 - np.abs(np.matmul(fake_features, real_features.T))
+        min_d = np.min(d, axis=1)
+    else:
+        fake_features = torch.div(fake_features, torch.norm(fake_features, dim=1).view(-1, 1))
+        d = 1.0 - torch.abs(torch.mm(fake_features, real_features_tensor.T))
+        min_d, _ = torch.min(d, dim=1)
     return min_d
 
 # prepare save directory
@@ -197,6 +213,18 @@ os.makedirs(log_dir)
 # prepare writer
 writer = SummaryWriter(logdir=log_dir)
 
+# define testing generator
+def generator_sampler(generator, num_instances, bsize, latent_dim, normalize=True):
+    with torch.no_grad():
+        for i in range(0, num_instances, bsize):
+            z = Variable(Tensor(np.random.normal(0, 1, (bsize, latent_dim))))
+            fake_imgs = generator(z)
+            if i + bsize > num_instances:
+                fake_imgs = fake_imgs[i + bsize - num_instances:]
+            if normalize:
+                fake_imgs += 1
+                fake_imgs /= 2
+            yield fake_imgs, 0
 # ----------
 #  Training
 # ----------
@@ -261,10 +289,11 @@ for epoch in range(opt.n_epochs):
             g_loss.backward()
             optimizer_G.step()
 
-            print(
-                    "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
-                % (epoch, opt.n_epochs, i, len(dataloader), d_loss.item(), g_loss.item())
-            )
+            if opt.verbose:
+                print(
+                        "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
+                    % (epoch, opt.n_epochs, i, len(dataloader), d_loss.item(), g_loss.item())
+                )
             batches_done += opt.n_critic
 
     writer.add_scalar('loss/d_loss', d_loss.item(), epoch)
@@ -278,14 +307,18 @@ for epoch in range(opt.n_epochs):
         writer.add_image('sampled_images', sampled_images, epoch)
 
     if epoch % opt.metric_interval == 0:
-        fake_features = get_activation(fake_imgs, inception_v3, cuda=cuda).view(-1, 2048)
-        mmd = compute_memorization_distance(fake_features).mean()
-        # compute in numpy
-        fake_mu, fake_sigma = get_stats(fake_features.cpu().data.numpy())
-        fid = calculate_frechet_distance(fake_mu, fake_sigma, real_mu, real_sigma)
+        generator.eval()
+        fake_features = get_activations(generator_sampler(generator, opt.num_samples, opt.batch_size, opt.latent_dim, normalize=True), inception_v3, cuda=cuda)
+        generator.train()
+        # fake_features = get_activation((fake_imgs + 1) / 2, inception_v3, cuda=cuda).view(-1, 2048) # scale [-1, 1] to [0, 1]
+        mmd = np.mean(compute_memorization_distance(fake_features, use_numpy=True))
+        # mmd = compute_memorization_distance(fake_features).mean()
+        fake_mu, fake_sigma = get_stats(fake_features)
+        # fake_mu, fake_sigma = get_stats(fake_features.cpu().data.numpy())
+        fid = calculate_frechet_distance(fake_mu, fake_sigma, real_mu, real_sigma) # numpy input
         writer.add_scalar('metric/fid', fid, epoch)
-        writer.add_scalar('metric/mmd', mmd.item(), epoch)
-        print("[Epoch %d/%d] [fid: %f] [mmd: %f]" % (epoch, opt.n_epochs, fid, mmd.item()))
+        writer.add_scalar('metric/mmd', mmd, epoch)
+        print("[Epoch %d/%d] [D loss: %f] [G loss: %f] [fid: %f] [mmd: %f]" % (epoch, opt.n_epochs, d_loss.item(), g_loss.item(), fid, mmd))
 
     if epoch % opt.save_model_interval == 0 and epoch > 0:
         torch.save(generator.state_dict(), os.path.join(log_dir, f"generator_epoch{epoch}.pth"))

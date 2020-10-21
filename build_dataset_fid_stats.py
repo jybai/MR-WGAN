@@ -20,9 +20,8 @@ import torch
 
 from fid.inception import InceptionV3
 
-def get_activation(batch, model, dims=2048, cuda=False):
-    if cuda:
-        batch = batch.cuda()
+def get_activation(batch, model, device, dims=2048):
+    batch = batch.to(device)
 
     pred = model(batch)[0]
 
@@ -33,8 +32,8 @@ def get_activation(batch, model, dims=2048, cuda=False):
 
     return pred
 
-def get_activations(dataloader, model, dims=2048,
-                    cuda=False, verbose=False):
+def get_activations(dataloader, model, device, dims=2048,
+                    verbose=False, use_numpy=True):
     """Calculates the activations of the pool_3 layer for all images.
 
     Params:
@@ -63,13 +62,15 @@ def get_activations(dataloader, model, dims=2048,
 
         batch = torch.from_numpy(images).type(torch.FloatTensor)
         '''
-        pred = get_activation(batch, model, dims, cuda)
-        pred_arr.append(pred.cpu().data.numpy().reshape(pred.size(0), -1))
+        pred = get_activation(batch, model, device, dims).reshape(-1, dims)
+        pred_arr.append(pred)
 
     if verbose:
         print(' done')
 
-    return np.concatenate(pred_arr, axis=0)
+    pred_arr = torch.cat(pred_arr, dim=0)
+
+    return pred_arr if not use_numpy else pred_arr.cpu().data.numpy()
 
 def get_stats(features):
     mu = np.mean(features, axis=0)
