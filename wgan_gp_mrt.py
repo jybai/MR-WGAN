@@ -6,7 +6,6 @@ import sys
 from datetime import datetime
 import time
 import yaml
-import GPUtil
 
 import torchvision.transforms as transforms
 from torchvision.utils import save_image, make_grid
@@ -25,112 +24,28 @@ from torchsummary import summary
 
 from fid.inception import InceptionV3
 from fid.fid_score import calculate_frechet_distance
-from build_dataset_fid_stats import get_activation, get_activations, get_stats
+from build_dataset_fid_stats import get_stats
+from utils import mask_gpu, seed_everything
+from wgan_gp import Generator, Discriminator, GeneratorMRSampler, compute_gradient_penalty
 
-def mask_gpu(gpu_index=None):
-    gpus = GPUtil.getGPUs()
-
-    if gpu_index is None:
-        mem_frees = [gpu.memoryFree for gpu in gpus]
-        gpu_index = mem_frees.index(max(mem_frees))
-
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[gpu_index].id)
-
-def seed_everything(seed=1126):
-    os.environ['PYTHONHASHSEED']=str(seed)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    import random
-    random.seed(seed)
-
-class View(nn.Module):
-    """https://github.com/pytorch/vision/issues/720#issuecomment-581142009
-    """
-    def __init__(self, shape):
-        super(View, self).__init__()
-        self.shape = shape,  # extra comma
-    def forward(self, x):
-        return x.view(*self.shape)
-
-class Generator(nn.Module):
-    def __init__(self, latent_dim, n_channels):
-        super(Generator, self).__init__()
-
-        def block(in_feat, out_feat, normalize=True):
-            layers = [nn.ConvTranspose2d(in_feat, out_feat, kernel_size=5, stride=2, padding=2, output_padding=1)]
-            if normalize:
-                layers.append(nn.BatchNorm2d(out_feat, momentum=0.8))
-            layers.append(nn.ReLU(inplace=True))
-            return layers
-
-        self.model = nn.Sequential(
-            nn.Linear(latent_dim, 4*4*4*latent_dim),
-            nn.BatchNorm1d(4*4*4*latent_dim, momentum=0.8), # not aligned with original
-            nn.ReLU(inplace=True),
-            View([-1, 4*latent_dim, 4, 4]),
-            *block(4*latent_dim, 2*latent_dim),
-            *block(2*latent_dim, latent_dim),
-            nn.ConvTranspose2d(latent_dim, n_channels, kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.Tanh()
-        )
-
-    def forward(self, z):
-        img = self.model(z)
-        return img
-
-class Discriminator(nn.Module):
-    def __init__(self, latent_dim, n_channels):
-        super(Discriminator, self).__init__()
-
-        self.model = nn.Sequential(
-            nn.Conv2d(n_channels, latent_dim, kernel_size=5, stride=2, padding=2),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(latent_dim, 2*latent_dim, kernel_size=5, stride=2, padding=2),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(2*latent_dim, 4*latent_dim, kernel_size=5, stride=2, padding=2),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Flatten(),
-            nn.Linear(4*4*4*latent_dim, 1),
-        )
-
-    def forward(self, img):
-        validity = self.model(img)
-        return validity
-
-class GeneratorMRSampler():
-    def __init__(self, generator, mr, mrt, mrt_decay, latent_dim, device, 
+class GeneratorMRTSampler(GeneratorMRSampler):
+    def __init__(self, generator, mrt, mrt_decay, latent_dim, device, 
                  real_features, proj_model=None, bsize=64, normalize=True):
-        self.g = generator
-        self.mr = mr
         self.mrt = mrt
-        self.final_mrt = mrt
         self.mrt_decay = mrt_decay
-        self.latent_dim = latent_dim
-        self.device = device
-        self.bsize = bsize
-        self.normalize = normalize
 
-        self.real = torch.from_numpy(real_features).to(self.device)
-        self.real = torch.div(self.real, torch.norm(self.real, dim=1).view(-1, 1))
+        super(GeneratorMRTSampler, self).__init__(
+                generator=generator, latent_dim=latent_dim, device=device, 
+                real_features=real_features, proj_model=proj_model, 
+                bsize=bsize, normalize=normalize)
 
-        if proj_model is None:
-            block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[2048]
-            self.proj_model = InceptionV3([block_idx]).to(self.device)
-            self.proj_model.eval()
-
-        if self.mr:
-            self.n_total_samples = 0
-            self.n_accepted_samples = 0
+        self.final_mrt = mrt
+        self.n_total_samples = 0
+        self.n_accepted_samples = 0
 
     def reset_running_stats(self):
-        if self.mr:
-            self.n_total_samples = 0
-            self.n_accepted_samples = 0
-            # self.final_mrt = self.mrt
-
-    def __iter__(self):
-        return self
+        self.n_total_samples = 0
+        self.n_accepted_samples = 0
 
     def get_mrr(self):
         if self.n_total_samples == 0:
@@ -141,40 +56,17 @@ class GeneratorMRSampler():
     def get_mrt(self):
         return self.final_mrt
 
-    def gen_features(self, n_instances):
-        fake_features = []
-        n_now = 0
-        while n_now < n_instances:
-            fake_features_ = self._gen_features()
-            n_now += fake_features_.shape[0]
-            if n_now > n_instances:
-                fake_features_ = fake_features_[n_now - n_instances:]
-            fake_features.append(fake_features_)
-        fake_features = torch.cat(fake_features)
-        assert(fake_features.shape[0] == n_instances)
-        return fake_features
-
-    def compute_memorization_distance(self, fake_features_tensor):
-        fake_norms = torch.norm(fake_features_tensor, dim=1).view(-1, 1)
-        fake_features_tensor = torch.div(fake_features_tensor, fake_norms)
-        d = 1.0 - torch.abs(torch.mm(fake_features_tensor, self.real.T))
-        min_d, _ = torch.min(d, dim=1)
-        return min_d
-
-    def _gen_features(self, z=None):
-        if z is None:
-            z = self.__next__()
-        fake_imgs = self.g(z)
-        fake_features_tensor = get_activation((fake_imgs + 1) / 2, self.proj_model, 
-                                              device=self.device).view(-1, 2048)
-        return fake_features_tensor
-
     def __next__(self):
-        with torch.no_grad():
-            if self.mr:
+        if self.mrt == 0:
+            z = super(GeneratorMRTSampler, self).__next__()
+
+            self.n_total_samples += self.bsize
+            self.n_accepted_samples += self.bsize
+        else:
+            with torch.no_grad():
                 n_total_samples, n_accepted_samples = 0, 0
                 z = []
-                self.final_mrt = self.mrt
+                self.final_mrt = self.mrt # reset mrt back
 
                 while n_accepted_samples < self.bsize:
                     z_ = Variable(torch.from_numpy(np.random.normal(0, 1, (self.bsize, self.latent_dim))).float()).to(self.device)
@@ -196,45 +88,7 @@ class GeneratorMRSampler():
 
                 self.n_total_samples += n_total_samples
                 self.n_accepted_samples += n_accepted_samples
-            else:
-                z = Variable(torch.from_numpy(np.random.normal(0, 1, (self.bsize, self.latent_dim))).float()).to(self.device)
         return z
-
-def compute_gradient_penalty(D, real_samples, fake_samples, device):
-    """Calculates the gradient penalty loss for WGAN GP"""
-    # Random weight term for interpolation between real and fake samples
-    alpha = torch.from_numpy(np.random.random((real_samples.size(0), 1, 1, 1))).float().to(device)
-    # Get random interpolation between real and fake samples
-    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
-    d_interpolates = D(interpolates)
-    fake = Variable(torch.empty(real_samples.shape[0], 1).fill_(1.0), requires_grad=False).to(device)
-    # Get gradient w.r.t. interpolates
-    gradients = autograd.grad(
-        outputs=d_interpolates,
-        inputs=interpolates,
-        grad_outputs=fake,
-        create_graph=True,
-        retain_graph=True,
-        only_inputs=True,
-    )[0]
-    gradients = gradients.view(gradients.size(0), -1)
-    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-    return gradient_penalty
-
-# benchmark variables
-def benchmark(op_name):
-    def decorator(func):
-        def wrapped(*args, **kwargs):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            output = func(*args, **kwargs)
-            end.record()
-            torch.cuda.synchronize()
-            print(op_name, start.elapsed_time(end))
-            return output
-        return wrapped
-    return decorator
 
 def main():
 
@@ -260,9 +114,9 @@ def main():
     parser.add_argument("--metric_interval", type=int, default=10, help="interval betwen metrics evaluations")
     parser.add_argument("--save_model_interval", type=int, default=100, help="interval betwen model saves")
     parser.add_argument("--print_interval", type=int, default=1, help="interval betwen printing training stats")
-    parser.add_argument('--mr', action='store_true')
     parser.add_argument("--mrt", type=float, default=0, help="Minimum memorization rejection threshold, cosine distance have to be greater than mrt")
     parser.add_argument("--mrt_decay", type=float, default=0.02, help="Decay for minimum memorization rejection threshold in case nothing satisfies")
+    parser.add_argument("--epoch_start", type=int, default=0, help="the index of the beginning of training, usually set when loaded from pretrain model")
     parser.add_argument("--load_gen_path", default=None, help="path to load the generator state_dict")
     parser.add_argument("--load_dis_path", default=None, help="path to load the discriminator state_dict")
     parser.add_argument("--path_path", default='path.yml', help="path to configuration for training related file paths and dirs")
@@ -282,8 +136,8 @@ def main():
     # Initialize generator and discriminator
     generator = Generator(latent_dim=opt.latent_dim, n_channels=opt.n_channels).to(device=opt.device)
     discriminator = Discriminator(latent_dim=opt.latent_dim, n_channels=opt.n_channels).to(device=opt.device)
-    gs = GeneratorMRSampler(generator, opt.mr, opt.mrt, opt.mrt_decay, opt.latent_dim, opt.device, 
-                            real_features, bsize=opt.batch_size)
+    gs = GeneratorMRTSampler(generator, opt.mrt, opt.mrt_decay, opt.latent_dim, opt.device, 
+                             real_features, bsize=opt.batch_size)
 
     if opt.load_gen_path is not None:
         generator.load_state_dict(torch.load(opt.load_gen_path))
@@ -310,7 +164,7 @@ def main():
         ),
         batch_size=opt.batch_size,
         shuffle=True,
-        drop_last=True,
+        drop_last=True, # to avoid sample images not full (if last batch less than 36)
     )
 
     # Optimizers
@@ -322,10 +176,13 @@ def main():
         timestamp = datetime.fromtimestamp(time.time()).strftime('%Y%m%d%H%M')
         log_dir = os.path.join(opt.paths['img_dir'], timestamp)
         os.makedirs(log_dir)
+        # dump options config
+        with open(os.path.join(log_dir, 'opt.yml'), 'w') as f:
+            yaml.dump(opt, f, default_flow_style=False)
         # prepare writer
         writer = SummaryWriter(logdir=log_dir)
 
-    for epoch in range(opt.n_epochs):
+    for epoch in range(opt.epoch_start + 1, opt.n_epochs + 1):
 
         generator.train()
         gs.reset_running_stats()
@@ -363,23 +220,18 @@ def main():
             writer.add_scalar('loss/d_loss', d_loss.item(), epoch)
             writer.add_scalar('loss/g_loss', g_loss.item(), epoch)
 
-            if opt.mr:
-                writer.add_scalar('stats/mrr', gs.get_mrr(), epoch)
-                writer.add_scalar('stats/mrt', gs.get_mrt(), epoch)
+            writer.add_scalar('stats/mrr', gs.get_mrr(), epoch)
+            writer.add_scalar('stats/mrt', gs.get_mrt(), epoch)
 
-        if epoch % opt.print_interval == 0:
-            print_str = f"{datetime.now().strftime('%Y/%m/%d %H:%M:%S')} [Epoch {epoch}/{opt.n_epochs}] [D loss: {d_loss.item()}] [G loss: {g_loss.item()}]"
-            if opt.mr:
-                print_str += f" [mrr: {gs.get_mrr()}] [mrt: {gs.get_mrt()}]"
+        if epoch % opt.print_interval == 0 or opt.test:
+            print_str = f"{datetime.now().strftime('%Y/%m/%d %H:%M:%S')} [Epoch {epoch}/{opt.n_epochs}] [D loss: {d_loss.item()}] [G loss: {g_loss.item()}] [mrr: {gs.get_mrr()}] [mrt: {gs.get_mrt()}]"
             print(print_str)
 
         if epoch % opt.sample_interval == 0 and not opt.test:
             img_fname = os.path.join(log_dir, f"{epoch}.png")
             save_image(fake_imgs.data[:36], img_fname, nrow=6, normalize=True)
-            # sampled_images = make_grid(fake_imgs.data[:36], nrow=6, normalize=True)
-            # writer.add_image('sampled_images', sampled_images, epoch)
 
-        if epoch % opt.metric_interval == 0:
+        if epoch % opt.metric_interval == 0 or opt.test:
 
             with torch.no_grad():
                 fake_features_tensor = gs.gen_features(n_instances=10000).detach()
@@ -395,7 +247,7 @@ def main():
 
             print(f"{datetime.now().strftime('%Y/%m/%d %H:%M:%S')} [fid: {fid}] [mmd: {mmd}]")
 
-        if epoch % opt.save_model_interval == 0 and epoch > 0 and not opt.test:
+        if epoch % opt.save_model_interval == 0 and epoch > 1 and not opt.test:
             torch.save(generator.state_dict(), os.path.join(log_dir, f"generator_epoch{epoch}.pth"))
             torch.save(discriminator.state_dict(), os.path.join(log_dir, f"discriminator_epoch{epoch}.pth"))
 

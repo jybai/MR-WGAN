@@ -77,15 +77,16 @@ def get_stats(features):
     sigma = np.cov(features, rowvar=False)
     return mu, sigma
 
-def prepare_data(batch_size):
-    # Configure data loader
-    data_dir = "/home/cybai2020/PyTorch-GAN/data/cifar10"
+def prepare_data(mode, batch_size=64, data_dir="~/MRGAN/data/cifar10"):
+    if mode != 'train' and mode != 'test':
+        raise ValueError(f"mode must be either \'train\' or \'test\' but got {mode}.")
+    # Configure data loader 
     os.makedirs(data_dir, exist_ok=True)
 
     dataloader = torch.utils.data.DataLoader(
         datasets.CIFAR10(
             data_dir,
-            train=True,
+            train=(mode == 'train'),
             download=True,
             transform=transforms.Compose(
                 [transforms.ToTensor()]
@@ -97,31 +98,29 @@ def prepare_data(batch_size):
     return dataloader
 
 def main():
-    cuda = True
-    batch_size = 64
     dims = 2048
-    prep_dataset_stats_path = 'cifar10-train.npz'
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    if not os.path.isfile(prep_dataset_stats_path):
-        block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
-        model = InceptionV3([block_idx])
-        if cuda:
-            model.cuda()
+    for mode in ['train', 'test']:
+        prep_dataset_stats_path = f'cifar10-{mode}.npz'
 
-        dataloader = prepare_data(batch_size)
-        features = get_activations(dataloader, model, dims, cuda, verbose=False)
-        mu, sigma = get_stats(features)
+        if not os.path.isfile(prep_dataset_stats_path):
+            block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+            model = InceptionV3([block_idx]).to(device)
+            model.eval()
 
-        np.savez(prep_dataset_stats_path, features=features, mu=mu, sigma=sigma)
+            dataloader = prepare_data(mode)
+            features = get_activations(dataloader, model, device, dims, verbose=False)
+            mu, sigma = get_stats(features)
 
-    else:
-        f = np.load(prep_dataset_stats_path)
-        features, mu, sigma = f['features'][:], f['mu'][:], f['sigma'][:]
-        f.close()
+            np.savez(prep_dataset_stats_path, features=features, mu=mu, sigma=sigma)
 
-    print(features.shape)
-    print(mu.shape)
-    print(sigma.shape)
+        else:
+            with np.load(prep_dataset_stats_path) as f:
+                features, mu, sigma = f['features'], f['mu'], f['sigma']
+
+        print(mode)
+        print(features.shape, mu.shape, sigma.shape)
 
 if __name__ == '__main__':
     main()
